@@ -5,6 +5,12 @@ const ArrayList = std.ArrayList;
 const StringHashMap = std.StringHashMap;
 const testing = std.testing;
 
+//TODO implement some sort of value stack for parsing?
+//TODO implement memoization to prevent relooking for things
+//TODO use sequence arrays and choice arrays so grammars aren't as fugly
+//TODO add additional recurser functions if necessary
+//TODO figure out what's wrong with the predicates and why they get stuck in infinite loops
+
 const LabelType = []const u8;
 
 pub const StatelessGrammar = Grammar(void);
@@ -123,6 +129,9 @@ pub fn Grammar(comptime State: type) type {
             }
             return struct {
                 pub fn f(text: []const u8, visitor: ?Visitor) Value {
+                    if (text.len < 1) {
+                        return Value.failure("char range in '" ++ [_]u8{low} ++ "'-'" ++ [_]u8{high} ++ "' - no input", text.ptr, visitor);
+                    }
                     if ((text.len > 0) and (text[0] >= low) and (text[0] <= high)) {
                         return Value.success(text, 1, null, visitor);
                     } else {
@@ -136,8 +145,11 @@ pub fn Grammar(comptime State: type) type {
             //Terminal: accepts any character in string cs as one character (S+)
             return struct {
                 pub fn f(text: []const u8, visitor: ?Visitor) Value {
+                    if (text.len < 1) {
+                        return Value.failure("char in [" ++ cs ++ "] - no input", text.ptr, visitor);
+                    }
                     inline for (cs) |c| {
-                        if ((text.len > 0) and (text[0] == c)) {
+                        if ((text.len > 1) and (text[0] == c)) {
                             return Value.success(text, 1, null, visitor);
                         }
                     }
@@ -150,8 +162,11 @@ pub fn Grammar(comptime State: type) type {
             //Terminal: accepts any character not in string cs as one character (S+)
             return struct {
                 pub fn f(text: []const u8, visitor: ?Visitor) Value {
+                    if (text.len < 1) {
+                        return Value.failure("none of [" ++ cs ++ "] - no input", text.ptr, visitor);
+                    }
                     inline for (cs) |c| {
-                        if ((text.len > 0) and (text[0] == c)) {
+                        if (text[0] == c) {
                             return Value.failure("none of [" ++ cs ++ "]", text.ptr, visitor);
                         }
                     }
@@ -172,7 +187,7 @@ pub fn Grammar(comptime State: type) type {
             return struct {
                 pub fn f(text: []const u8, visitor: ?Visitor) Value {
                     inline for (str) |c, i| {
-                        if ((text.len > i) and (text[i] != c)) {
+                        if ((text.len < (i + 1)) or (text[i] != c)) {
                             return Value.failure("string \"" ++ str ++ "\"", text.ptr + i, visitor);
                         }
                     }
@@ -237,12 +252,58 @@ pub fn Grammar(comptime State: type) type {
             }.f;
         }
 
-        pub fn sequences(comptime parsers: var) comptime ParserFn {
+        pub fn recurserMany(comptime pre: ParserFn, comptime alternatives: ParserFn, comptime post: ParserFn, comptime labelName: []const u8) comptime ParserFn {
             return struct {
                 pub fn f(text: []const u8, visitor: ?Visitor) Value {
-                    var lastRes = parsers[0](text, visitor);
+                    std.debug.warn("--fn start\n", .{});
                     var matchedLen: usize = 0;
-                    inline for (parsers) |parser| {
+                    const preRes = pre(text, visitor);
+                    std.debug.warn("---parsed pre\n", .{});
+                    if (!preRes.isSuccess()) {
+                        return preRes;
+                    }
+                    var restOfText = preRes.Success.rest;
+                    matchedLen += preRes.Success.matched.len;
+                    var altRes = preRes;
+                    while (altRes.isSuccess()) {
+                        std.debug.warn("---alt start\n", .{});
+                        altRes = alternatives(restOfText, visitor);
+                        std.debug.warn("---alt end\n", .{});
+                        if (!altRes.isSuccess()) {
+                            std.debug.warn("---- recurse start\n", .{});
+                            const nextLevel = recurserMany(pre, alternatives, post, labelName);
+                            altRes = nextLevel(restOfText, visitor);
+                            std.debug.warn("---- recurse end\n", .{});
+                        }
+                        if (altRes.isSuccess()) {
+                            std.debug.warn("--- was success\n", .{});
+                            restOfText = altRes.Success.rest;
+                            matchedLen += altRes.Success.matched.len;
+                        }
+                    }
+                    std.debug.warn("--- test parse\n", .{});
+                    const postRes = post(restOfText, visitor);
+                    std.debug.warn("--fn end\n", .{});
+                    if (postRes.isSuccess()) {
+                        return Value.success(text, matchedLen + postRes.Success.matched.len, null, visitor);
+                    }
+                    return postRes;
+                }
+            }.f;
+        }
+
+        pub fn sequences(comptime parsers: var) comptime ParserFn {
+            for (std.meta.fields(@TypeOf(parsers))) |fieldInfo| {
+                if (fieldInfo.field_type != ParserFn) {
+                    @compileError("Arguments must be ParserFns");
+                }
+            }
+            return struct {
+                pub fn f(text: []const u8, visitor: ?Visitor) Value {
+                    var lastRes = parsers.@"0"(text, visitor);
+                    var matchedLen: usize = 0;
+                    inline for (std.meta.fields(@TypeOf(parsers))) |parserField| {
+                        const parser = @field(parsers, parserField.name);
                         lastRes = parser(text, visitor);
                         if (lastRes.isSuccess()) {
                             matchedLen += lastRes.Success.matched.len;
@@ -376,7 +437,7 @@ pub fn debugMatch(parser: debugMatchGrammar.ParserFn, text: []const u8) bool {
         pub fn f(state: *usize, val: Grammar(usize).Value, parserAddr: usize) void {
             if (val.isSuccess()) {
                 if (val.Success.label) |aLabel| {
-                    std.debug.warn("MATCH: [{}] ({}) <{}> \"{}\"\n", .{ @ptrToInt(val.Success.matched.ptr) - state.*, aLabel, parserAddr, val.Success.matched });
+                    std.debug.warn("MATCH: [{}] ({}) !<{}> \"{}\"\n", .{ @ptrToInt(val.Success.matched.ptr) - state.*, aLabel, parserAddr, val.Success.matched });
                 } else {
                     std.debug.warn("MATCH: [{}] ({})  \"{}\"\n", .{ @ptrToInt(val.Success.matched.ptr) - state.*, parserAddr, val.Success.matched });
                 }
@@ -388,12 +449,12 @@ pub fn debugMatch(parser: debugMatchGrammar.ParserFn, text: []const u8) bool {
     return parser(text, Grammar(usize).Visitor{ .state = &textStart, .visitorFn = visitorFn }).isSuccess();
 }
 
-test "debugMatch" {
-    const g = Grammar(usize);
-    const grammar = comptime g.oneOrMore(g.sequence(g.spaces, g.label("words", g.letters)));
-    std.debug.warn("\n", .{});
-    testing.expect(debugMatch(grammar, " ab cd efg"));
-}
+//test "debugMatch" {
+//const g = Grammar(usize);
+//const grammar = comptime g.oneOrMore(g.sequence(g.spaces, g.label("words", g.letters)));
+//std.debug.warn("\n", .{});
+//testing.expect(debugMatch(grammar, " ab cd efg"));
+//}
 
 const Matcher = struct {
     //a type that stores all matches as they happen and provides a hashmap to lookup all matches of a given label
@@ -522,8 +583,8 @@ const Matcher = struct {
 //    }
 //}
 
-//test "sequences" {
-//    const g = Grammar(void);
-//    const grammar = comptime g.sequences(.{ g.spaces, g.letters, g.spaces, g.letters });
-//    testing.expect(match(grammar, " ab cd"));
-//}
+test "sequences" {
+    const g = Grammar(void);
+    const grammar = comptime g.sequences(.{ g.spaces, g.letters, g.digits });
+    testing.expect(match(grammar, " ab123"));
+}

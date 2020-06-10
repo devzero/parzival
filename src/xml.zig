@@ -6,60 +6,11 @@ const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const ArrayList = std.ArrayList;
 
-pub const Node = struct {
-    const NodeType = enum { rootNode, elementNode, textNode, commentNode, processingInstructionNode, cdataNode, docTypeNode };
-    nodeType: NodeType,
-    allocator: *Allocator,
-    parent: ?*Node,
-    nodes: []*Node,
-    nodesByTag: StringHashMap(ArrayList(*Node)),
-    attrib: StringHashMap([]const u8),
-    tag: []const u8,
-    text: []const u8,
-
-    pub fn init(allocator: *Allocator, data: []const u8) ParseErrors!*Node {
-        var self = try allocator.create(Node);
-        self.nodeType = .rootNode;
-        self.allocator = allocator;
-        self.parent = null;
-        self.nodes = &[_]*Node{};
-        self.nodesByTag = StringHashMap(ArrayList(*Node)).init(self.allocator);
-        self.attrib = StringHashMap([]const u8).init(self.allocator);
-        self.tag = &[_]u8{};
-        self.text = &[_]u8{};
-        var size = try self.parse(data);
-        if (size < data.len) {
-            return error.ParsingError; //didn't parse the whole document?
-        }
-        return self;
-    }
-    pub fn initChild(parent: *Node, nodeType: NodeType) !*Node {
-        var self = try parent.allocator.create(Node);
-        self.nodeType = nodeType;
-        self.allocator = parent.allocator;
-        self.parent = parent;
-        self.nodes = &[_]*Node{};
-        self.nodesByTag = StringHashMap(ArrayList(*Node)).init(self.allocator);
-        self.attrib = StringHashMap([]const u8).init(self.allocator);
-        self.tag = &[_]u8{};
-        self.text = &[_]u8{};
-        return self;
-    }
-
-    const States = enum {
-        startState, charData, startStateElem, bangThing, commentState, processingInstr, docType, cdataState, tagName, tagWhitespace, attribName, attribEq, attribValue, selfEndTag, contentsState, endTag, endState
-    };
-};
-
-const XMLState = struct {
-    //Nodes
-};
-
-const XMLParser = struct {};
+const XMLState = struct {};
 
 const XMLGrammar = parzival.Grammar(XMLState);
 
-const DOCUMENT = comptime label("DOCUMENT", sequence(PROLOG, sequence(ELEMENT, sequence(oneOrMore(MISC)))));
+const DOCUMENT = comptime label("DOCUMENT", sequence(optional(PROLOG), sequence(ELEMENT, many(MISC))));
 const PROLOG = comptime label("PROLOG", sequence(XMLDECL, sequence(many(MISC), optional(sequence(DOCTYPEDECL, many(MISC))))));
 const XMLDECL = comptime label("XMLDECL", sequence(string("<?xml"), sequence(VERSIONINFO, sequence(optional(ENCODINGDECL), sequence(optional(SDDECL), sequence(optional(S), string("?>")))))));
 const VERSIONINFO = comptime label("VERSIONINFO", sequence(S, sequence(string("version"), sequence(EQ, choice(sequence(string("\""), sequence(VERSIONNUM, string("\""))), sequence(string("'"), sequence(VERSIONNUM, string("'"))))))));
@@ -94,7 +45,7 @@ const MIXED = comptime label("MIXED", choice(sequence(char('('), sequence(option
 const CHILDREN = comptime label("CHILDREN", sequence(choice(CHOICE, SEQ), optional(choice(char('?'), choice(char('*'), char('+'))))));
 const CHOICE = comptime label("CHOICE", sequence(char('('), sequence(optional(S), sequence(CP, sequence(oneOrMore(sequence(optional(S), sequence(char('|'), sequence(optional(S), CP)))), sequence(optional(S), char(')')))))));
 //const CP = comptime label("CP", sequence(choice(NAME, choice(CHOICE, SEQ)), optional(choice(char('*'), choice(char('+'), char('?'))))));
-const CP = comptime label("CP", sequence(NAME, optional(choice(char('*'), choice(char('+'), char('?')))))); //intentionally not allowing nested choice/seqs because they cause a loop in the grammar
+const CP = comptime label("CP", sequence(NAME, optional(choice(char('*'), choice(char('+'), char('?')))))); //intentionally not allowing nested choice/seqs because they cause a loop in the grammar TODO: FIXME
 const SEQ = comptime label("SEQ", sequence(char('('), sequence(optional(S), sequence(CP, sequence(oneOrMore(sequence(optional(S), sequence(char(','), sequence(optional(S), CP)))), sequence(optional(S), char(')')))))));
 const ATTLISTDECL = comptime label("ATTLISTDECL", sequence(string("<!ATTLIST"), sequence(S, sequence(NAME, sequence(many(ATTDEF), sequence(S, char('>')))))));
 const ATTDEF = comptime label("ATTDEF", sequence(S, sequence(NAME, sequence(ATTTYPE, sequence(S, DEFAULTDECL)))));
@@ -116,8 +67,9 @@ const PUBLICID = comptime label("PUBLICID", sequence(string("PUBLIC"), sequence(
 const DEFAULTDECL = comptime label("DEFAULTDECL", choice(string("#REQUIRED"), choice(string("#IMPLIED"), sequence(optional(sequence(string("#FIXED"), S)), ATTVALUE))));
 const PI = comptime label("PI", sequence(string("<?"), sequence(PITARGET, sequence(S, sequence(many(charNotSet("?>")), string("?>"))))));
 const PITARGET = comptime label("PITARGET", sequence(notPredicate(sequence(charSet("Xx"), sequence(charSet("Mm"), charSet("Ll")))), NAME));
-const ELEMENT = comptime label("ELEMENT", choice(EMPTYELEMTAG, sequence(STAG, CONTENT, ETAG)));
-const EMPTYELEMTAG = comptime label("EMPTELEMTAG", sequence(char('<'), sequence(NAME, sequence(many(sequence(S, ATTRIBUTE)), sequence(optional(S), string("/>"))))));
+const ELEMENT = comptime label("ELEMENT", choice(NORMALELEMENT, EMPTYELEMTAG));
+const NORMALELEMENT = comptime label("NORMALELEMENT", recurserMany(STAG, choice(EMPTYELEMTAG, choice(REFERENCE, choice(CDSECT, choice(PI, choice(COMMENT, CHARDATA))))), ETAG, "CONTENT"));
+const EMPTYELEMTAG = comptime label("EMPTYELEMTAG", sequence(char('<'), sequence(NAME, sequence(many(sequence(S, ATTRIBUTE)), sequence(optional(S), string("/>"))))));
 const ATTRIBUTE = comptime label("ATTRIBUTE", sequence(NAME, sequence(EQ, ATTVALUE)));
 const ATTVALUE = comptime label("ATTVALUE", choice(sequence(char('"'), sequence(many(choice(PEREFERENCE, choice(REFERENCE, charNotSet("<&\"")))), char('"'))), sequence(char('\''), sequence(many(choice(PEREFERENCE, choice(REFERENCE, charNotSet("<&\"")))), char('\'')))));
 const REFERENCE = comptime label("REFERENCE", choice(ENTITYREF, CHARREF));
@@ -125,15 +77,15 @@ const ENTITYREF = comptime label("ENTITYREF", sequence(char('&'), sequence(NAME,
 const CHARREF = comptime label("CHARREF", choice(sequence(string("&#"), sequence(digits, char(';'))), sequence(string("&#x"), sequence(hexdigits, char(';')))));
 const STAG = comptime label("STAG", sequence(char('<'), sequence(NAME, sequence(many(sequence(S, ATTRIBUTE)), sequence(optional(S), char('>'))))));
 const ETAG = comptime label("ETAG", sequence(string("</"), sequence(NAME, sequence(optional(S), char('>')))));
-const CONTENT = comptime label("CONTENT", sequence(optional(CHARDATA), sequence(many(choice(ELEMENT, choice(REFERENCE, choice(CDSECT, choice(PI, COMMENT))))), optional(CHARDATA))));
-const CHARDATA = comptime label("CHARDATA", many(sequence(many(charNotSet("[<&")), sequence(notPredicate(string("]]>")), many(charNotSet("[<&")))))); //not sure about this one
+//const CHARDATA = comptime label("CHARDATA", oneOrMore(charNotSet("[<&"))); //many(sequence(many(charNotSet("[<&")), sequence(notPredicate(string("]]>")), many(charNotSet("[<&")))))); //not sure about this one
+const CHARDATA = comptime label("CHARDATA", oneOrMore(choice(charNotSet("<&]"), sequence(char(']'), notPredicate(string("]>"))))));
 const CDSECT = comptime label("CDSECT", sequence(CDSTART, sequence(CDATA, CDEND)));
 const CDSTART = comptime label("CDSTART", string("<!CDATA["));
-const CDATA = comptime label("CDATA", many(sequence(charNotSet(']'), sequence(notPedicate(string("]]"), any))))); //not sure about this one
+const CDATA = comptime label("CDATA", many(sequence(charNotSet("]"), sequence(notPredicate(string("]]")), charAny)))); //not sure about this one
 const CDEND = comptime label("CDEND", string("]]>"));
 
-usingnamespace XMLGrammar;
+usingnamespace parzival.debugMatchGrammar;
 
 test "foo" {
-    testing.expect(DOCUMENT("<element/>", null).isSuccess());
+    testing.expect(parzival.debugMatch(DOCUMENT, "<tag> and stuff <element/> and a</tag>"));
 }
