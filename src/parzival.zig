@@ -3,27 +3,36 @@ const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const ArrayList = std.ArrayList;
 const StringHashMap = std.StringHashMap;
-const testing = std.testing;
-
-//TODO implement some sort of value stack for parsing?
+const ComptimeStringMap = std.ComptimeStringMap;
+//TODO implement "Rules" setting mechanism where you comptime register a set of Rules with Enum labels
 //TODO implement memoization to prevent relooking for things
-//TODO use sequence arrays and choice arrays so grammars aren't as fugly
-//TODO add additional recurser functions if necessary
+//TODO add additional recurser functions if necessary? maybe solve with Rule system?
 //TODO figure out what's wrong with the predicates and why they get stuck in infinite loops
+//TODO implement some sort of value stack with action functions for parsing? -- maybe not action tags might be sufficient?
+//TODO use sequence arrays and choice arrays so grammars aren't as fugly -- blocking on zig issue #5579
+//TODO don't use {}.f trick -- blocking on zig issue #1717
+//TODO refactor Value type when you can include a value with an error -- blocking on zig issue #2647
 
-const LabelType = []const u8;
+pub const StatelessGrammar = Grammar(void, null);
 
-pub const StatelessGrammar = Grammar(void);
-
-pub fn Grammar(comptime State: type) type {
+pub fn Grammar(comptime State: type, rulesFunc: var) type {
     //represents a set of primitive parsing functions to create parsers from.  State is the data type used to store any state passed to a visitor object if they are called.
     return struct {
         pub const Self = @This();
 
         pub const ParserFn = fn (text: []const u8, visitor: ?Visitor) Value; //a Function prototype for all Parsing Functions (all parsing is composed from these)
 
+        pub const LabelType = comptime []const u8;
+
+        pub const RuleSet = if (rulesFunc) |theRulesFunc| {
+            theRulesFunc(Self);
+        } else {
+            ComptimeStringMap(ParerFn, .{});
+        };
+
         pub const Visitor = struct {
             state: *State,
+            topVisitorFn: ?fn (state: *State, parser: usize) void = null,
             visitorFn: fn (state: *State, val: Value, parser: usize) void,
         };
 
@@ -79,6 +88,18 @@ pub fn Grammar(comptime State: type) type {
             expected: []const u8 = &[_]u8{}, //a constant string describing the type of parsing failure that happened
             loc: [*]const u8, //a pointer to the beginning point of the failure in the original text
         };
+
+        pub fn rule(comptime ruleName: []const u8) ParserFn {
+            //represents a reference to another parsing rule by name
+            return struct {
+                pub fn f(text: []const u8, visitor: ?Visitor) Value {
+                    if (Self.RuleSet.get(ruleName)) |theParser| {
+                        return theParser(text, visitor);
+                    }
+                    return Value.failure("rule: rule \"" ++ ruleName ++ "\" not found", text.ptr, visitor);
+                }
+            }.f;
+        }
 
         pub fn label(labeltag: []const u8, comptime p: ParserFn) ParserFn {
             //Annotates positive results with an optional label that is retrievable when visiting
@@ -176,6 +197,7 @@ pub fn Grammar(comptime State: type) type {
         }
 
         pub fn charAny(text: []const u8, visitor: ?Visitor) Value {
+            //consumes any single character
             if (text.len > 0) {
                 return Value.success(text, 1, null, visitor);
             } else {
@@ -183,7 +205,23 @@ pub fn Grammar(comptime State: type) type {
             }
         }
 
+        pub fn any(text: []const u8, visitor: ?Visitor) Value {
+            //always matches and consumes no characters -- use of this is DANGEROUS and can lead to infinite loops
+            return Value.success(text, 0, null, visitor);
+        }
+
+        pub fn rest(text: []const u8, visitor: ?Visitor) Value {
+            //always matches and consumes all of the rest of the characters in the input string
+            return Value.success(text, text.len, null, visitor);
+        }
+
+        pub fn fail(text: []const u8, visitor: ?Visitor) Value {
+            //always fails immediately, consumes nothing
+            return Value.failure("fail", text.prt, visitor);
+        }
+
         pub fn string(comptime str: []const u8) ParserFn {
+            //matches a specific comptime literal string
             return struct {
                 pub fn f(text: []const u8, visitor: ?Visitor) Value {
                     inline for (str) |c, i| {
@@ -232,6 +270,8 @@ pub fn Grammar(comptime State: type) type {
             }.f;
         }
 
+        //pub fn choices(comptime parsers: var) -- equivalent to sequences() for choice, blocking on bug TODO
+
         pub fn sequence(comptime a: ParserFn, comptime b: ParserFn) comptime ParserFn {
             // tries to match a and b in order
             return struct {
@@ -266,24 +306,17 @@ pub fn Grammar(comptime State: type) type {
                     matchedLen += preRes.Success.matched.len;
                     var altRes = preRes;
                     while (altRes.isSuccess()) {
-                        std.debug.warn("---alt start\n", .{});
                         altRes = alternatives(restOfText, visitor);
-                        std.debug.warn("---alt end\n", .{});
                         if (!altRes.isSuccess()) {
-                            std.debug.warn("---- recurse start\n", .{});
                             const nextLevel = recurserMany(pre, alternatives, post, labelName);
                             altRes = nextLevel(restOfText, visitor);
-                            std.debug.warn("---- recurse end\n", .{});
                         }
                         if (altRes.isSuccess()) {
-                            std.debug.warn("--- was success\n", .{});
                             restOfText = altRes.Success.rest;
                             matchedLen += altRes.Success.matched.len;
                         }
                     }
-                    std.debug.warn("--- test parse\n", .{});
                     const postRes = post(restOfText, visitor);
-                    std.debug.warn("--fn end\n", .{});
                     if (postRes.isSuccess()) {
                         return Value.success(text, matchedLen + postRes.Success.matched.len, null, visitor);
                     }
@@ -292,29 +325,30 @@ pub fn Grammar(comptime State: type) type {
             }.f;
         }
 
-        pub fn sequences(comptime parsers: var) comptime ParserFn {
-            for (std.meta.fields(@TypeOf(parsers))) |fieldInfo| {
-                if (fieldInfo.field_type != ParserFn) {
-                    @compileError("Arguments must be ParserFns");
-                }
-            }
-            return struct {
-                pub fn f(text: []const u8, visitor: ?Visitor) Value {
-                    var lastRes = parsers.@"0"(text, visitor);
-                    var matchedLen: usize = 0;
-                    inline for (std.meta.fields(@TypeOf(parsers))) |parserField| {
-                        const parser = @field(parsers, parserField.name);
-                        lastRes = parser(text, visitor);
-                        if (lastRes.isSuccess()) {
-                            matchedLen += lastRes.Success.matched.len;
-                        } else {
-                            return Value.success(text, matchedLen, null, visitor);
-                        }
-                    }
-                    return Value.success(text, matchedLen, null, visitor);
-                }
-            }.f;
-        }
+        // NOT WORKING YET DUE TO BUG https://github.com/ziglang/zig/issues/5579
+        //pub fn sequences(comptime parsers: var) comptime ParserFn {
+        //    for (std.meta.fields(@TypeOf(parsers))) |fieldInfo| {
+        //        if (fieldInfo.field_type != ParserFn) {
+        //            @compileError("Arguments must be ParserFns");
+        //        }
+        //    }
+        //    return struct {
+        //        pub fn f(text: []const u8, visitor: ?Visitor) Value {
+        //            var lastRes = parsers.@"0"(text, visitor);
+        //            var matchedLen: usize = 0;
+        //            inline for (std.meta.fields(@TypeOf(parsers))) |parserField| {
+        //                const parser = @field(parsers, parserField.name);
+        //                lastRes = parser(text, visitor);
+        //                if (lastRes.isSuccess()) {
+        //                    matchedLen += lastRes.Success.matched.len;
+        //                } else {
+        //                    return Value.success(text, matchedLen, null, visitor);
+        //                }
+        //            }
+        //            return Value.success(text, matchedLen, null, visitor);
+        //        }
+        //    }.f;
+        //}
 
         pub fn optional(comptime p: ParserFn) comptime ParserFn {
             //will match zero or one instance of p
@@ -422,19 +456,16 @@ pub fn match(parser: StatelessGrammar.ParserFn, text: []const u8) bool {
     return parser(text, null).isSuccess();
 }
 
-//test "match" {
-//    const g = StatelessGrammar;
-//    const grammar = comptime g.sequence(g.spaces, g.letters);
-//    testing.expect(match(grammar, "  abcd"));
-//}
-
-pub const debugMatchGrammar = Grammar(usize); //grammar used by debugMatch
-
-pub fn debugMatch(parser: debugMatchGrammar.ParserFn, text: []const u8) bool {
-    //returns true iff the provided debugMatchGrammar parser matches text and prints verbose callback information to undestand how it is parsing
+pub fn debugMatch(comptime grammar: type, parser: var, text: []const u8) bool {
+    //returns true iff the provided Grammar parser matches text and prints verbose callback information to undestand how it is parsing
+    comptime {
+        if (@TypeOf(parser) != grammar.ParserFn) {
+            @compileError("Type mismatch between grammar and parser type");
+        }
+    }
     var textStart: usize = @ptrToInt(text.ptr);
     const visitorFn = struct {
-        pub fn f(state: *usize, val: Grammar(usize).Value, parserAddr: usize) void {
+        pub fn f(state: *usize, val: grammar.Value, parserAddr: usize) void {
             if (val.isSuccess()) {
                 if (val.Success.label) |aLabel| {
                     std.debug.warn("MATCH: [{}] ({}) !<{}> \"{}\"\n", .{ @ptrToInt(val.Success.matched.ptr) - state.*, aLabel, parserAddr, val.Success.matched });
@@ -446,15 +477,8 @@ pub fn debugMatch(parser: debugMatchGrammar.ParserFn, text: []const u8) bool {
             }
         }
     }.f;
-    return parser(text, Grammar(usize).Visitor{ .state = &textStart, .visitorFn = visitorFn }).isSuccess();
+    return parser(text, grammar.Visitor{ .state = &textStart, .visitorFn = visitorFn }).isSuccess();
 }
-
-//test "debugMatch" {
-//const g = Grammar(usize);
-//const grammar = comptime g.oneOrMore(g.sequence(g.spaces, g.label("words", g.letters)));
-//std.debug.warn("\n", .{});
-//testing.expect(debugMatch(grammar, " ab cd efg"));
-//}
 
 const Matcher = struct {
     //a type that stores all matches as they happen and provides a hashmap to lookup all matches of a given label
@@ -556,35 +580,3 @@ const Matcher = struct {
         }
     }
 };
-
-//test "matches" {
-//    const g = Matcher.GrammarType;
-//    const grammar = comptime g.oneOrMore(g.sequence(g.spaces, g.label("words", g.letters)));
-//    var m = try Matcher.init(testing.allocator, grammar);
-//    defer m.deinit();
-//    var input = "  a b cd efg";
-//    testing.expect(try m.match(input));
-//    std.debug.warn("\nmatches:\n", .{});
-//    if (m.matches) |matches| {
-//        for (matches) |aMatch| {
-//            std.debug.warn("  \"{}\"\n", .{aMatch});
-//        }
-//    }
-//    std.debug.warn("\nlabels:\n", .{});
-//    if (m.labels) |labels| {
-//        var iterator = labels.iterator();
-//        while (iterator.next()) |item| {
-//            std.debug.warn("  \"{}\":\"[", .{item.key});
-//            for (item.value) |s| {
-//                std.debug.warn(" \"{}\",", .{s});
-//            }
-//            std.debug.warn("]\n", .{});
-//        }
-//    }
-//}
-
-test "sequences" {
-    const g = Grammar(void);
-    const grammar = comptime g.sequences(.{ g.spaces, g.letters, g.digits });
-    testing.expect(match(grammar, " ab123"));
-}
